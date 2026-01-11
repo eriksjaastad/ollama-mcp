@@ -17,10 +17,10 @@
 ## Project Summary
 
 **What this project does:**
-An MCP server that exposes local Ollama models to AI clients. It handles model listing, single/parallel execution, and records detailed telemetry for performance analysis.
+An MCP server that exposes local Ollama models to AI clients. It handles model listing, single/parallel execution, records detailed telemetry, and includes **Smart Local Routing** for automatic model selection based on task type.
 
 **Current status:**
-Core MCP tools and telemetry system are complete. Project structure has been standardized according to `project-scaffolding` patterns.
+Core MCP tools, telemetry system, and Smart Local Routing are complete. Project structure is standardized according to `project-scaffolding` patterns.
 
 **Key constraints:**
 - All local execution ($0 cost).
@@ -55,11 +55,13 @@ Core MCP tools and telemetry system are complete. Project structure has been sta
 # Compile and check for TS errors
 npm run build
 
-# Run smoke test
+# Run smoke tests
 node scripts/smoke_test.js
+node scripts/test_routing.js
 
-# Check telemetry analysis
+# Check telemetry & routing analysis
 node scripts/analyze-runs.js
+node scripts/analyze_routing_performance.js
 ```
 
 ---

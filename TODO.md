@@ -1,8 +1,8 @@
 # Ollama MCP - TODO
 
-**Last Updated:** January 1, 2026  
-**Project Status:** Production Ready  
-**Current Phase:** Project Complete
+**Last Updated:** January 10, 2026
+**Project Status:** Production Ready
+**Current Phase:** Smart Routing Complete - Awaiting Telemetry Data
 
 ---
 
@@ -11,22 +11,44 @@
 ### What's Working ✅
 - **MCP Server:** Successfully exposes 3 tools to Cursor/Claude
 - **ollama_list_models:** Lists all locally installed Ollama models
-- **ollama_run:** Executes single model with prompt + options
+- **ollama_run:** Executes single model with prompt + options + task_type routing
 - **ollama_run_many:** Concurrent execution with configurable concurrency (max 8)
+- **🧠 Smart Routing:** Task-type based model selection with fallback chains (config/routing.yaml)
+- **🔍 Response Quality:** isGoodResponse() detects poor/refused responses and triggers fallback
+- **🚨 Escalation:** Returns `escalate: true` when all local models fail
 - **Validation:** Model names, prompts, options all validated
 - **Safety:** Command injection prevention, timeout handling
 - **TypeScript Build:** Compiles cleanly to `dist/server.js`
 - **📊 Telemetry Logging:** All runs logged to `~/.ollama-mcp/runs.jsonl`
-- **📈 Analysis Script:** `scripts/analyze-runs.js` provides insights
+- **📈 Analysis Scripts:** `analyze-runs.js` + `analyze_routing_performance.js`
+- **⏰ Self-Reminder:** Telemetry review trigger (30 days + 50 runs)
 
 ### What's Missing ❌
-- **Real-world testing:** Need to run on actual workload to verify logging
-- **Week of data:** No performance patterns yet (just deployed)
+- **Real-world usage data:** Need 50+ runs with task_type to validate routing effectiveness
+- **Learned routing iteration:** First telemetry review will happen after 30 days + 50 runs (auto-triggered)
+
+### 🚨 INCIDENT LOG: 2026-01-04
+- **Issue:** Server failed to start in Cursor with `ERR_MODULE_NOT_FOUND` (missing `@modelcontextprotocol/sdk`).
+- **Root Cause:** `node_modules` were missing from the production directory.
+- **Fix:** Ran `npm install` and `npm run build`. Verified with `smoke_test.js`.
+- **Lesson:** Project needs a reliability check to ensure it's "production ready" beyond just code completion.
 
 ### Blockers & Dependencies
-- None - telemetry is additive, doesn't block existing functionality
+- None
 
 ---
+
+## ✅ Smart Routing Enhancement (January 10, 2026)
+
+**Implemented & Verified:**
+- [x] Task-type routing (classification, extraction, code, reasoning, file_mod, auto)
+- [x] YAML-based fallback chains (config/routing.yaml)
+- [x] Response quality detection (isGoodResponse)
+- [x] Escalation flag when all local models fail
+- [x] Telemetry review trigger (auto-reminder after 30 days + 50 runs)
+- [x] Learned routing analysis script (scripts/analyze_routing_performance.js)
+
+**Prompts used:** `Documents/planning/SMART_ROUTING_PROMPTS_INDEX.md`
 
 ## ✅ Completed Tasks
 
@@ -112,6 +134,7 @@
 
 ### Project Complete When:
 - [x] Telemetry working reliably
+- [x] Smart Local Routing implemented and verified
 - [x] Analysis shows actionable insights
 - [x] Pattern documented for extraction to project-scaffolding
 

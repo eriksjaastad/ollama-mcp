@@ -25,6 +25,7 @@ Bridge between the Model Context Protocol (MCP) and local Ollama models. Enables
 - `scripts/smoke_test.js` - Server validation script
 
 ### Documentation
+- `PITCH.md` - Strategic value and high-level project summary
 - `Documents/` - Centralized documentation (Standard pattern)
   - `core/ARCHITECTURE_OVERVIEW.md` - System design
   - `core/OPERATIONS_GUIDE.md` - Setup and deployment

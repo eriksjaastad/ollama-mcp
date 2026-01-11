@@ -7,7 +7,15 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { spawn } from "child_process";
 import { promisify } from "util";
+import { readFileSync, createReadStream } from "fs";
+import { join, dirname } from "path";
+import { fileURLToPath } from "url";
+import readline from "readline";
+import yaml from "js-yaml";
 import { logRun, generateBatchId } from "./logger.js";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 
 const sleep = promisify(setTimeout);
 
@@ -19,6 +27,48 @@ const DEFAULT_TIMEOUT_MS = 120000; // 120s
 const DEFAULT_CONCURRENCY = 3;
 const MAX_CONCURRENCY = 8;
 
+// Routing defaults
+const DEFAULT_CHAINS: Record<string, string[]> = {
+  classification: ["llama3.2:3b", "qwen3:14b"],
+  extraction: ["llama3.2:3b", "qwen3:14b"],
+  code: ["qwen3:14b", "deepseek-r1:14b"],
+  reasoning: ["deepseek-r1:14b", "qwen3:14b"],
+  file_mod: ["qwen3:14b", "deepseek-r1:14b"],
+  auto: ["qwen3:14b", "deepseek-r1:14b", "llama3.2:3b"],
+};
+
+// Load routing config (SSOT)
+const CONFIG_PATH = join(__dirname, "..", "config", "routing.yaml");
+interface RoutingConfig {
+  default_model: string;
+  fallback_chains: Record<string, string[]>;
+  telemetry_review: {
+    last_review: string;
+    review_interval_days: number;
+    min_runs_before_review: number;
+  };
+}
+
+let routingConfig: RoutingConfig = {
+  default_model: "qwen3:14b",
+  fallback_chains: DEFAULT_CHAINS,
+  telemetry_review: {
+    last_review: "2026-01-10",
+    review_interval_days: 30,
+    min_runs_before_review: 50,
+  },
+};
+
+try {
+  const fileContents = readFileSync(CONFIG_PATH, "utf8");
+  const loaded = yaml.load(fileContents) as any;
+  if (loaded && loaded.fallback_chains) {
+    routingConfig = { ...routingConfig, ...loaded };
+  }
+} catch (e) {
+  console.error("Notice: Using default routing (config/routing.yaml not found or invalid)");
+}
+
 interface OllamaRunOptions {
   temperature?: number;
   num_predict?: number;
@@ -27,9 +77,10 @@ interface OllamaRunOptions {
 }
 
 interface OllamaJob {
-  model: string;
+  model?: string;
   prompt: string;
   options?: OllamaRunOptions;
+  task_type?: "classification" | "extraction" | "code" | "reasoning" | "file_mod" | "auto";
 }
 
 interface OllamaResult {
@@ -37,6 +88,73 @@ interface OllamaResult {
   stderr: string;
   exitCode: number;
   error?: string;
+  metadata?: {
+    model_used: string;
+    task_type: string;
+    duration_ms: number;
+    timed_out: boolean;
+    models_tried: string[];
+    escalate: boolean;
+    escalation_reason?: string;
+    telemetry_review_due: boolean;
+    runs_since_last_review: number;
+  };
+}
+
+/**
+ * Checks if a telemetry review is due based on date and number of runs.
+ */
+async function checkTelemetryReviewDue(): Promise<{ due: boolean; runsSinceReview: number }> {
+  const telemetryPath = join(process.env.HOME || "", ".ollama-mcp", "runs.jsonl");
+  let runsSinceReview = 0;
+  const lastReviewDate = new Date(routingConfig.telemetry_review.last_review);
+
+  try {
+    const fileStream = createReadStream(telemetryPath);
+    const rl = readline.createInterface({
+      input: fileStream,
+      crlfDelay: Infinity,
+    });
+
+    for await (const line of rl) {
+      if (!line.trim()) continue;
+      try {
+        const run = JSON.parse(line);
+        const runDate = new Date(run.timestamp);
+        if (runDate >= lastReviewDate) {
+          runsSinceReview++;
+        }
+      } catch (e) {
+        // Skip malformed lines
+      }
+    }
+  } catch (e) {
+    // File not found or other read error, return defaults
+    return { due: false, runsSinceReview: 0 };
+  }
+
+  const daysSinceReview = (Date.now() - lastReviewDate.getTime()) / (1000 * 60 * 60 * 24);
+  const due =
+    daysSinceReview >= routingConfig.telemetry_review.review_interval_days &&
+    runsSinceReview >= routingConfig.telemetry_review.min_runs_before_review;
+
+  return { due, runsSinceReview };
+}
+
+// Port from AI Router - detect bad responses
+function isGoodResponse(text: string, taskType: string): boolean {
+  // Too short (unless it's a classification or extraction task)
+  const minLength = taskType === "classification" || taskType === "extraction" ? 1 : 40;
+  if (text.trim().length < minLength) return false;
+
+  // Refusal patterns
+  const refusals = ["I cannot", "I'm unable", "I don't have access"];
+  if (refusals.some((r) => text.toLowerCase().includes(r.toLowerCase()))) return false;
+
+  // Empty or error
+  if (!text.trim()) return false;
+
+  return true;
 }
 
 // Validate inputs
@@ -118,7 +236,8 @@ async function ollamaRun(
   prompt: string,
   options?: OllamaRunOptions,
   batchId?: string,
-  concurrency?: number
+  concurrency?: number,
+  task_type?: string
 ): Promise<OllamaResult> {
   validateModel(model);
   validatePrompt(prompt);
@@ -183,6 +302,7 @@ async function ollamaRun(
         timed_out: timedOut,
         batch_id: batchId,
         concurrency: concurrency,
+        task_type: task_type,
       });
       
       if (timedOut) {
@@ -191,12 +311,32 @@ async function ollamaRun(
           stderr: stderr + "\nProcess timed out",
           exitCode: -1,
           error: "Timeout exceeded",
+          metadata: {
+            model_used: model,
+            task_type: task_type || "auto",
+            duration_ms: durationMs,
+            timed_out: true,
+            models_tried: [model],
+            escalate: false,
+            telemetry_review_due: false,
+            runs_since_last_review: 0,
+          }
         });
       } else {
         resolve({
           stdout,
           stderr,
           exitCode: code ?? -1,
+          metadata: {
+            model_used: model,
+            task_type: task_type || "auto",
+            duration_ms: durationMs,
+            timed_out: false,
+            models_tried: [model],
+            escalate: false,
+            telemetry_review_due: false,
+            runs_since_last_review: 0,
+          }
         });
       }
     });
@@ -219,6 +359,7 @@ async function ollamaRun(
         timed_out: false,
         batch_id: batchId,
         concurrency: concurrency,
+        task_type: task_type,
       });
       
       resolve({
@@ -226,9 +367,84 @@ async function ollamaRun(
         stderr: stderr + "\n" + err.message,
         exitCode: -1,
         error: err.message,
+        metadata: {
+          model_used: model,
+          task_type: task_type || "auto",
+          duration_ms: durationMs,
+          timed_out: false,
+          models_tried: [model],
+          escalate: false,
+          telemetry_review_due: false,
+          runs_since_last_review: 0,
+        }
       });
     });
   });
+}
+
+// Run a single model with smart routing and fallback
+async function ollamaRunWithRouting(
+  job: OllamaJob,
+  batchId?: string,
+  concurrency?: number
+): Promise<OllamaResult> {
+  const { model, prompt, options, task_type } = job;
+
+  // Resolve fallback chain (SSOT from routingConfig)
+  let chain: string[] = [];
+  if (model) {
+    chain = [model];
+  } else if (task_type && routingConfig.fallback_chains[task_type]) {
+    chain = routingConfig.fallback_chains[task_type];
+  } else {
+    // Default to auto or a balanced model from config
+    chain = routingConfig.fallback_chains["auto"] || [routingConfig.default_model || "qwen3:14b"];
+  }
+
+  const modelsTried: string[] = [];
+  let lastResult: OllamaResult | null = null;
+  const telemetryStatus = await checkTelemetryReviewDue();
+
+  for (const targetModel of chain) {
+    modelsTried.push(targetModel);
+    const result = await ollamaRun(targetModel, prompt, options, batchId, concurrency, task_type);
+    lastResult = result;
+
+    // Check for success and quality
+    if (result.exitCode === 0 && !result.error && isGoodResponse(result.stdout, task_type || "auto")) {
+      return {
+        ...result,
+        metadata: {
+          ...result.metadata!,
+          task_type: task_type || "auto",
+          models_tried: modelsTried,
+          telemetry_review_due: telemetryStatus.due,
+          runs_since_last_review: telemetryStatus.runsSinceReview,
+        },
+      };
+    }
+
+    console.error(`[routing] Model ${targetModel} failed or gave poor response. Trying next in chain...`);
+  }
+
+  // If all failed or were poor, return last result with escalation flag
+  return {
+    stdout: lastResult?.stdout || "",
+    stderr: (lastResult?.stderr || "") + "\nAll local models in fallback chain failed or gave poor responses",
+    exitCode: lastResult?.exitCode ?? -1,
+    error: "All local models in fallback chain failed or gave poor responses",
+    metadata: {
+      model_used: modelsTried[modelsTried.length - 1],
+      task_type: task_type || "auto",
+      duration_ms: lastResult?.metadata?.duration_ms || 0,
+      timed_out: lastResult?.metadata?.timed_out || false,
+      models_tried: modelsTried,
+      escalate: true,
+      escalation_reason: "all_local_models_failed",
+      telemetry_review_due: telemetryStatus.due,
+      runs_since_last_review: telemetryStatus.runsSinceReview,
+    },
+  };
 }
 
 // Run many models concurrently with a limit
@@ -244,7 +460,7 @@ async function ollamaRunMany(
 
   // Validate all jobs first
   for (const job of jobs) {
-    validateModel(job.model);
+    if (job.model) validateModel(job.model);
     validatePrompt(job.prompt);
     validateOptions(job.options);
   }
@@ -269,7 +485,7 @@ async function ollamaRunMany(
         queueIndex++;
         activeCount++;
 
-        ollamaRun(job.model, job.prompt, job.options, batchId, concurrency).then((result) => {
+        ollamaRunWithRouting(job, batchId, concurrency).then((result) => {
           results[index] = result;
           activeCount--;
           processNext();
@@ -314,11 +530,16 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           properties: {
             model: {
               type: "string",
-              description: "Name of the Ollama model to run",
+              description: "Name of the Ollama model to run (bypasses smart routing if provided)",
             },
             prompt: {
               type: "string",
               description: "Prompt to send to the model",
+            },
+            task_type: {
+              type: "string",
+              enum: ["classification", "extraction", "code", "reasoning", "file_mod", "auto"],
+              description: "Type of task for smart routing",
             },
             options: {
               type: "object",
@@ -343,7 +564,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               },
             },
           },
-          required: ["model", "prompt"],
+          required: ["prompt"],
         },
       },
       {
@@ -360,11 +581,16 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                 properties: {
                   model: {
                     type: "string",
-                    description: "Model name",
+                    description: "Model name (optional if task_type provided)",
                   },
                   prompt: {
                     type: "string",
                     description: "Prompt text",
+                  },
+                  task_type: {
+                    type: "string",
+                    enum: ["classification", "extraction", "code", "reasoning", "file_mod", "auto"],
+                    description: "Type of task for smart routing",
                   },
                   options: {
                     type: "object",
@@ -377,7 +603,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                     },
                   },
                 },
-                required: ["model", "prompt"],
+                required: ["prompt"],
               },
             },
             maxConcurrency: {
@@ -408,14 +634,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "ollama_run": {
-        const { model, prompt, options } = request.params.arguments as {
-          model: string;
+        const { model, prompt, options, task_type } = request.params.arguments as {
+          model?: string;
           prompt: string;
           options?: OllamaRunOptions;
+          task_type?: "classification" | "extraction" | "code" | "reasoning" | "file_mod" | "auto";
         };
         
-        console.error(`[ollama_run] model=${model}, prompt_length=${prompt.length}`);
-        const result = await ollamaRun(model, prompt, options);
+        console.error(`[ollama_run] task_type=${task_type || 'none'}, model=${model || 'auto'}`);
+        const result = await ollamaRunWithRouting({ model, prompt, options, task_type });
         
         return {
           content: [
@@ -424,6 +651,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               text: JSON.stringify(result, null, 2),
             },
           ],
+          isError: result.metadata?.escalate,
         };
       }
 
